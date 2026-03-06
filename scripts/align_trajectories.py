@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Align two 2D trajectories using both position and yaw constraints.
+"""Align two 2D trajectories with a numpy/scipy least-squares optimizer.
 
-The script estimates a rigid-body transform in SE(2):
+The current model estimates a rigid-body transform in SE(2):
 
     p_target ~= R(theta) @ p_source + t
     yaw_target ~= yaw_source + theta
 
-Rotation is solved analytically from a weighted objective that combines:
-1. Position correspondences in the x-y plane.
-2. Heading correspondences derived from yaw angles.
+Residual blocks are assembled explicitly and passed to
+``scipy.optimize.least_squares``:
 
-Translation is then computed from the aligned position centroids.
+1. Position residuals for x/y correspondences.
+2. Angle residuals for yaw correspondences.
 
-Input CSV files must contain columns named: x, y, yaw
-Rows are assumed to be corresponding poses in the same order.
+The code keeps parameter packing/unpacking separate from residual assembly so
+future parameters (for example scale, sensor extrinsics, or time offsets) can
+be added without rewriting the optimization pipeline.
 """
 
 from __future__ import annotations
@@ -23,14 +24,25 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+
+import numpy as np
+from scipy.optimize import OptimizeResult, least_squares
 
 
 @dataclass(frozen=True)
-class Pose2D:
-    x: float
-    y: float
-    yaw: float
+class Trajectory2D:
+    xy: np.ndarray
+    yaw: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.xy.ndim != 2 or self.xy.shape[1] != 2:
+            raise ValueError("xy must have shape (N, 2).")
+        if self.yaw.ndim != 1 or self.yaw.shape[0] != self.xy.shape[0]:
+            raise ValueError("yaw must have shape (N,) and match xy.")
+
+    @property
+    def size(self) -> int:
+        return int(self.yaw.shape[0])
 
 
 @dataclass(frozen=True)
@@ -40,12 +52,42 @@ class Transform2D:
     ty: float
 
 
-def wrap_to_pi(angle: float) -> float:
-    """Wrap an angle to [-pi, pi)."""
-    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+@dataclass(frozen=True)
+class ParameterLayout:
+    names: tuple[str, ...]
+
+    def pack_transform(self, transform: Transform2D) -> np.ndarray:
+        return np.array([transform.theta, transform.tx, transform.ty], dtype=float)
+
+    def unpack_transform(self, params: np.ndarray) -> Transform2D:
+        if params.shape != (len(self.names),):
+            raise ValueError(
+                f"Expected parameter vector of shape ({len(self.names)},), "
+                f"got {params.shape}."
+            )
+        return Transform2D(theta=float(params[0]), tx=float(params[1]), ty=float(params[2]))
 
 
-def read_trajectory(csv_path: Path, degrees: bool) -> List[Pose2D]:
+@dataclass(frozen=True)
+class AlignmentConfig:
+    position_weight: float
+    yaw_weight: float
+    loss: str
+    f_scale: float
+    max_nfev: int | None
+
+
+DEFAULT_LAYOUT = ParameterLayout(names=("theta", "tx", "ty"))
+
+
+def wrap_to_pi(angle: np.ndarray | float) -> np.ndarray:
+    """Wrap angles to [-pi, pi)."""
+    angle_array = np.asarray(angle, dtype=float)
+    return (angle_array + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def read_trajectory(csv_path: Path, degrees: bool) -> Trajectory2D:
+    rows: list[tuple[float, float, float]] = []
     with csv_path.open("r", newline="", encoding="utf-8") as file_obj:
         reader = csv.DictReader(file_obj)
         if reader.fieldnames is None:
@@ -57,7 +99,6 @@ def read_trajectory(csv_path: Path, degrees: bool) -> List[Pose2D]:
             missing_text = ", ".join(sorted(missing))
             raise ValueError(f"{csv_path} is missing required columns: {missing_text}")
 
-        poses: List[Pose2D] = []
         for row_index, row in enumerate(reader, start=2):
             try:
                 x = float(row["x"])
@@ -71,145 +112,187 @@ def read_trajectory(csv_path: Path, degrees: bool) -> List[Pose2D]:
             if degrees:
                 yaw = math.radians(yaw)
 
-            poses.append(Pose2D(x=x, y=y, yaw=yaw))
+            rows.append((x, y, yaw))
 
-    if not poses:
+    if not rows:
         raise ValueError(f"{csv_path} does not contain any poses.")
 
-    return poses
+    xy = np.asarray([(x, y) for x, y, _ in rows], dtype=float)
+    yaw = np.asarray([yaw_value for _, _, yaw_value in rows], dtype=float)
+    return Trajectory2D(xy=xy, yaw=yaw)
 
 
-def mean_xy(poses: Sequence[Pose2D]) -> tuple[float, float]:
-    x_mean = sum(pose.x for pose in poses) / len(poses)
-    y_mean = sum(pose.y for pose in poses) / len(poses)
-    return x_mean, y_mean
-
-
-def estimate_transform(
-    source: Sequence[Pose2D],
-    target: Sequence[Pose2D],
-    position_weight: float,
-    yaw_weight: float,
-) -> Transform2D:
-    if len(source) != len(target):
+def validate_problem(
+    source: Trajectory2D,
+    target: Trajectory2D,
+    config: AlignmentConfig,
+) -> None:
+    if source.size != target.size:
         raise ValueError(
             "Source and target trajectories must contain the same number of poses. "
             "Rows are matched by index."
         )
 
-    if not source:
+    if source.size == 0:
         raise ValueError("At least one pose is required.")
 
-    if position_weight < 0.0 or yaw_weight < 0.0:
+    if config.position_weight < 0.0 or config.yaw_weight < 0.0:
         raise ValueError("Weights must be non-negative.")
 
-    if position_weight == 0.0 and yaw_weight == 0.0:
-        raise ValueError("At least one of position_weight or yaw_weight must be positive.")
+    if config.position_weight == 0.0 and config.yaw_weight == 0.0:
+        raise ValueError("At least one residual block must be enabled.")
 
-    source_mean_x, source_mean_y = mean_xy(source)
-    target_mean_x, target_mean_y = mean_xy(target)
+    if config.position_weight <= 0.0:
+        raise ValueError(
+            "position_weight must be positive because tx and ty are optimized "
+            "variables in the current model."
+        )
+
+    source_centered = source.xy - source.xy.mean(axis=0, keepdims=True)
+    target_centered = target.xy - target.xy.mean(axis=0, keepdims=True)
+    spread = np.linalg.norm(source_centered) + np.linalg.norm(target_centered)
+
+    if config.yaw_weight == 0.0 and spread < 1e-12:
+        raise ValueError(
+            "Rotation is not observable from position alone. Add geometric "
+            "variation or use a positive yaw_weight."
+        )
+
+    if config.f_scale <= 0.0:
+        raise ValueError("f_scale must be positive.")
+
+    if config.max_nfev is not None and config.max_nfev <= 0:
+        raise ValueError("max_nfev must be positive when provided.")
+
+
+def estimate_initial_transform(
+    source: Trajectory2D,
+    target: Trajectory2D,
+    config: AlignmentConfig,
+) -> Transform2D:
+    source_centered = source.xy - source.xy.mean(axis=0, keepdims=True)
+    target_centered = target.xy - target.xy.mean(axis=0, keepdims=True)
 
     cos_term = 0.0
     sin_term = 0.0
 
-    if position_weight > 0.0:
-        for source_pose, target_pose in zip(source, target):
-            src_x = source_pose.x - source_mean_x
-            src_y = source_pose.y - source_mean_y
-            tgt_x = target_pose.x - target_mean_x
-            tgt_y = target_pose.y - target_mean_y
-
-            cos_term += position_weight * (src_x * tgt_x + src_y * tgt_y)
-            sin_term += position_weight * (src_x * tgt_y - src_y * tgt_x)
-
-    if yaw_weight > 0.0:
-        for source_pose, target_pose in zip(source, target):
-            src_hx = math.cos(source_pose.yaw)
-            src_hy = math.sin(source_pose.yaw)
-            tgt_hx = math.cos(target_pose.yaw)
-            tgt_hy = math.sin(target_pose.yaw)
-
-            cos_term += yaw_weight * (src_hx * tgt_hx + src_hy * tgt_hy)
-            sin_term += yaw_weight * (src_hx * tgt_hy - src_hy * tgt_hx)
-
-    if math.isclose(cos_term, 0.0, abs_tol=1e-12) and math.isclose(
-        sin_term, 0.0, abs_tol=1e-12
-    ):
-        raise ValueError(
-            "Rotation is not observable from the provided data. Add more geometric "
-            "variation, or use a positive yaw_weight."
+    if config.position_weight > 0.0:
+        cos_term += config.position_weight * float(np.sum(source_centered * target_centered))
+        sin_term += config.position_weight * float(
+            np.sum(source_centered[:, 0] * target_centered[:, 1])
+            - np.sum(source_centered[:, 1] * target_centered[:, 0])
         )
 
+    if config.yaw_weight > 0.0:
+        yaw_delta = target.yaw - source.yaw
+        cos_term += config.yaw_weight * float(np.sum(np.cos(yaw_delta)))
+        sin_term += config.yaw_weight * float(np.sum(np.sin(yaw_delta)))
+
     theta = math.atan2(sin_term, cos_term)
+    rotation = rotation_matrix(theta)
+    translation = target.xy.mean(axis=0) - (source.xy @ rotation.T).mean(axis=0)
+
+    return Transform2D(theta=theta, tx=float(translation[0]), ty=float(translation[1]))
+
+
+def rotation_matrix(theta: float) -> np.ndarray:
     cos_theta = math.cos(theta)
     sin_theta = math.sin(theta)
-
-    tx = target_mean_x - (cos_theta * source_mean_x - sin_theta * source_mean_y)
-    ty = target_mean_y - (sin_theta * source_mean_x + cos_theta * source_mean_y)
-
-    return Transform2D(theta=theta, tx=tx, ty=ty)
+    return np.array([[cos_theta, -sin_theta], [sin_theta, cos_theta]], dtype=float)
 
 
-def apply_transform(poses: Iterable[Pose2D], transform: Transform2D) -> List[Pose2D]:
-    cos_theta = math.cos(transform.theta)
-    sin_theta = math.sin(transform.theta)
+def apply_transform(source: Trajectory2D, transform: Transform2D) -> Trajectory2D:
+    rotation = rotation_matrix(transform.theta)
+    translation = np.array([transform.tx, transform.ty], dtype=float)
+    aligned_xy = source.xy @ rotation.T + translation
+    aligned_yaw = wrap_to_pi(source.yaw + transform.theta)
+    return Trajectory2D(xy=aligned_xy, yaw=np.asarray(aligned_yaw, dtype=float))
 
-    aligned: List[Pose2D] = []
-    for pose in poses:
-        x = cos_theta * pose.x - sin_theta * pose.y + transform.tx
-        y = sin_theta * pose.x + cos_theta * pose.y + transform.ty
-        yaw = wrap_to_pi(pose.yaw + transform.theta)
-        aligned.append(Pose2D(x=x, y=y, yaw=yaw))
 
-    return aligned
+def build_residual_vector(
+    params: np.ndarray,
+    layout: ParameterLayout,
+    source: Trajectory2D,
+    target: Trajectory2D,
+    config: AlignmentConfig,
+) -> np.ndarray:
+    transform = layout.unpack_transform(params)
+    aligned_source = apply_transform(source, transform)
+    residual_blocks: list[np.ndarray] = []
+
+    if config.position_weight > 0.0:
+        position_residual = math.sqrt(config.position_weight) * (
+            aligned_source.xy - target.xy
+        )
+        residual_blocks.append(position_residual.reshape(-1))
+
+    if config.yaw_weight > 0.0:
+        yaw_residual = math.sqrt(config.yaw_weight) * wrap_to_pi(
+            aligned_source.yaw - target.yaw
+        )
+        residual_blocks.append(np.asarray(yaw_residual, dtype=float))
+
+    return np.concatenate(residual_blocks)
+
+
+def optimize_transform(
+    source: Trajectory2D,
+    target: Trajectory2D,
+    config: AlignmentConfig,
+    layout: ParameterLayout = DEFAULT_LAYOUT,
+) -> tuple[Transform2D, OptimizeResult]:
+    validate_problem(source, target, config)
+    initial_transform = estimate_initial_transform(source, target, config)
+    initial_params = layout.pack_transform(initial_transform)
+
+    result = least_squares(
+        build_residual_vector,
+        x0=initial_params,
+        args=(layout, source, target, config),
+        method="trf",
+        loss=config.loss,
+        f_scale=config.f_scale,
+        max_nfev=config.max_nfev,
+    )
+    if not result.success:
+        raise RuntimeError(f"Least-squares optimization failed: {result.message}")
+
+    return layout.unpack_transform(result.x), result
 
 
 def compute_metrics(
-    aligned_source: Sequence[Pose2D],
-    target: Sequence[Pose2D],
+    aligned_source: Trajectory2D,
+    target: Trajectory2D,
     degrees: bool,
 ) -> dict[str, float]:
-    if len(aligned_source) != len(target):
+    if aligned_source.size != target.size:
         raise ValueError("Metric inputs must have the same number of poses.")
 
-    position_error_sq = 0.0
-    yaw_error_sq = 0.0
-
-    for aligned_pose, target_pose in zip(aligned_source, target):
-        dx = aligned_pose.x - target_pose.x
-        dy = aligned_pose.y - target_pose.y
-        dyaw = wrap_to_pi(aligned_pose.yaw - target_pose.yaw)
-
-        position_error_sq += dx * dx + dy * dy
-        yaw_error_sq += dyaw * dyaw
-
-    count = len(aligned_source)
-    position_rmse = math.sqrt(position_error_sq / count)
-    yaw_rmse = math.sqrt(yaw_error_sq / count)
+    position_rmse = float(
+        np.sqrt(np.mean(np.sum((aligned_source.xy - target.xy) ** 2, axis=1)))
+    )
+    yaw_rmse = float(np.sqrt(np.mean(wrap_to_pi(aligned_source.yaw - target.yaw) ** 2)))
 
     if degrees:
         yaw_rmse = math.degrees(yaw_rmse)
 
-    return {
-        "position_rmse": position_rmse,
-        "yaw_rmse": yaw_rmse,
-    }
+    return {"position_rmse": position_rmse, "yaw_rmse": yaw_rmse}
 
 
-def write_trajectory(csv_path: Path, poses: Sequence[Pose2D], degrees: bool) -> None:
+def write_trajectory(csv_path: Path, trajectory: Trajectory2D, degrees: bool) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as file_obj:
         writer = csv.DictWriter(file_obj, fieldnames=["x", "y", "yaw"])
         writer.writeheader()
-        for pose in poses:
-            yaw = math.degrees(pose.yaw) if degrees else pose.yaw
-            writer.writerow({"x": pose.x, "y": pose.y, "yaw": yaw})
+        for xy, yaw in zip(trajectory.xy, trajectory.yaw):
+            yaw_value = math.degrees(float(yaw)) if degrees else float(yaw)
+            writer.writerow({"x": float(xy[0]), "y": float(xy[1]), "yaw": yaw_value})
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Align a source trajectory to a target trajectory using both x/y positions "
-            "and yaw angles to constrain a 2D rigid transform."
+            "Align a source trajectory to a target trajectory using weighted "
+            "x/y and yaw residuals solved by scipy.optimize.least_squares."
         )
     )
     parser.add_argument("source_csv", type=Path, help="CSV file with source trajectory")
@@ -228,13 +311,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--position-weight",
         type=float,
         default=1.0,
-        help="Weight of the x/y position constraints (default: 1.0)",
+        help="Weight of the x/y position residual block (default: 1.0)",
     )
     parser.add_argument(
         "--yaw-weight",
         type=float,
         default=1.0,
-        help="Weight of the yaw constraints (default: 1.0)",
+        help="Weight of the yaw residual block (default: 1.0)",
+    )
+    parser.add_argument(
+        "--loss",
+        choices=["linear", "soft_l1", "huber", "cauchy", "arctan"],
+        default="linear",
+        help="Robust loss passed to scipy.optimize.least_squares (default: linear)",
+    )
+    parser.add_argument(
+        "--f-scale",
+        type=float,
+        default=1.0,
+        help="f_scale argument for the chosen robust loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--max-nfev",
+        type=int,
+        default=None,
+        help="Optional maximum number of function evaluations",
     )
     return parser
 
@@ -245,23 +346,29 @@ def main() -> None:
 
     source = read_trajectory(args.source_csv, degrees=args.degrees)
     target = read_trajectory(args.target_csv, degrees=args.degrees)
-
-    transform = estimate_transform(
-        source=source,
-        target=target,
+    config = AlignmentConfig(
         position_weight=args.position_weight,
         yaw_weight=args.yaw_weight,
+        loss=args.loss,
+        f_scale=args.f_scale,
+        max_nfev=args.max_nfev,
     )
+
+    transform, optimizer_result = optimize_transform(source=source, target=target, config=config)
     aligned_source = apply_transform(source, transform)
     metrics = compute_metrics(aligned_source, target, degrees=args.degrees)
 
     angle_unit = "deg" if args.degrees else "rad"
     print("Estimated transform:")
     print(f"  theta: {transform.theta:.12f} rad")
-    if args.degrees:
-        print(f"         {math.degrees(transform.theta):.12f} deg")
+    print(f"         {math.degrees(transform.theta):.12f} deg")
     print(f"  tx:    {transform.tx:.12f}")
     print(f"  ty:    {transform.ty:.12f}")
+    print("Optimizer:")
+    print("  solver: scipy.optimize.least_squares")
+    print(f"  loss:   {args.loss}")
+    print(f"  nfev:   {optimizer_result.nfev}")
+    print(f"  cost:   {optimizer_result.cost:.12f}")
     print("Alignment error:")
     print(f"  position RMSE: {metrics['position_rmse']:.12f}")
     print(f"  yaw RMSE:      {metrics['yaw_rmse']:.12f} {angle_unit}")
